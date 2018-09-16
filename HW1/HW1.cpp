@@ -25,9 +25,7 @@ void preProcess(uchar4 **inputImage, unsigned char **greyImage,
                 uchar4 **d_rgbaImage, unsigned char **d_greyImage,
                 const std::string &filename) {
   //make sure the context initializes ok
-  // cudaFree(0);
-  // std::cout << cudaGetErrorString(cudaGetLastError()) << std::endl;
-  // checkCudaErrors(cudaFree(0));
+  checkCudaErrors(cudaFree(0));
 
   cv::Mat image;
   image = cv::imread(filename.c_str(), CV_LOAD_IMAGE_COLOR);
