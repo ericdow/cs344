@@ -43,23 +43,29 @@
 
  */
 
-__global__ void copy(unsigned int* const d_src, unsigned int* const d_dest, 
-    const size_t numElems) {
-  int tid = threadIdx.x + blockDim.x * blockIdx.x;
-  if (tid < numElems) 
-    d_dest[tid] = d_src[tid]; 
-}
-
 __global__ void hist(unsigned int* const d_inVals, unsigned int* const d_inPos,
     unsigned int* const d_outVals, unsigned int* const d_outPos, 
     const size_t numElems, const int bit, unsigned int* const d_bins) {
+ 
+  volatile int tid = threadIdx.x + blockDim.x * blockIdx.x;
   
-  int tid = threadIdx.x + blockDim.x * blockIdx.x;
+  __shared__ int bins[2];
   if (tid < numElems) {
+    bins[0] = 0;
+    bins[1] = 0;
+    __syncthreads();
+    
     if (d_inVals[tid] & (1 << bit)) // bit is 1
-      atomicAdd(&(d_bins[1]), 1);
+      atomicAdd(&(bins[1]), 1);
     else // bit is 0
-      atomicAdd(&(d_bins[0]), 1);
+      atomicAdd(&(bins[0]), 1);
+    __syncthreads(); 
+    
+    // Add the local value to the global value
+    if (threadIdx.x == 0) { 
+      atomicAdd(&(d_bins[0]), bins[0]);
+      atomicAdd(&(d_bins[1]), bins[1]);
+    }
   } 
 }
 
@@ -200,9 +206,11 @@ void your_sort(unsigned int* const d_inputVals,
         numElems, b, d_bins, d_offset0, d_offset1);
   }
 
-  // Copy data back to output 
-  copy<<<gridSize, blockSize>>>(d_inputVals, d_outputVals, numElems);
-  copy<<<gridSize, blockSize>>>(d_inputPos, d_outputPos, numElems);
+  // Copy data back to output
+  cudaMemcpy(d_outputVals, d_inputVals, sizeof(unsigned int) * numElems,
+      cudaMemcpyDeviceToDevice);
+  cudaMemcpy(d_outputPos, d_inputPos, sizeof(unsigned int) * numElems,
+      cudaMemcpyDeviceToDevice);
 
   cudaFree(d_bins);
   cudaFree(d_pred0);
