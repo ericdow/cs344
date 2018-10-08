@@ -134,12 +134,41 @@ __global__ void sort_bit(const unsigned short* const d_in_coarse_bin_ids,
 }
 
 __global__
-void yourHisto(const unsigned int* const d_vals, //INPUT
-               unsigned int* const d_histo,      //OUPUT
-               int numElems)
-{
-  //TODO fill in this kernel to calculate the histogram
-  //as quickly as possible
+void find_coarse_bin_starts(const unsigned short* const d_coarse_bin_ids,
+    unsigned int* const d_coarse_bin_starts, const size_t numElems) {
+  volatile int tid = threadIdx.x + blockDim.x * blockIdx.x;
+  if (tid < numElems - 1) {
+    if (d_coarse_bin_ids[tid+1] == d_coarse_bin_ids[tid] + 1) {
+      d_coarse_bin_starts[d_coarse_bin_ids[tid+1]] = tid + 1;
+    }
+  }
+}
+
+__global__
+void construct_hist(const unsigned int* const d_coarse_bin_starts, 
+    const unsigned int* const d_vals_sorted,
+    unsigned int* const d_histo, const size_t numElems) {
+  
+  // Compute a local histogram  
+  extern __shared__ unsigned int hist_local[];
+  hist_local[threadIdx.x] = 0;
+  __syncthreads();
+
+  volatile int start = d_coarse_bin_starts[blockIdx.x];
+  volatile int end = max((unsigned int) numElems, 
+      d_coarse_bin_starts[blockIdx.x + 1]);
+  do {
+    if (start + threadIdx.x < numElems) {
+      unsigned int bin = d_vals_sorted[start + threadIdx.x];
+      atomicAdd(&(hist_local[bin]), 1);
+    }
+    start += blockDim.x;
+  } while (start < end);
+  __syncthreads();
+
+  // Copy local histogram to global memory
+  if (hist_local[threadIdx.x] > 0)
+    d_histo[threadIdx.x] = hist_local[threadIdx.x]; 
 
 }
 
@@ -159,7 +188,7 @@ void computeHistogram(const unsigned int* const d_vals, //INPUT
         sizeof(unsigned short) * numElems));
 
   // Choose number of coarse bins to fit into shared memory
-  int memSize = 49152 / sizeof(unsigned int) / 2;
+  int memSize = 49152 / sizeof(unsigned int);
   int numCoarseBins = numElems / memSize;
   compute_coarse_bins<<<gridSize, blockSize>>>(d_vals, d_coarse_bin_ids,
       numElems, numCoarseBins);
@@ -195,12 +224,12 @@ void computeHistogram(const unsigned int* const d_vals, //INPUT
   checkCudaErrors(cudaMalloc((void **) &d_coarse_bin_ids_tmp, 
         sizeof(unsigned short) * numElems));
 
-  unsigned int * d_vals_1, * d_vals_2;
-  checkCudaErrors(cudaMalloc((void **) &d_vals_1, 
+  unsigned int * d_vals_sorted, * d_vals_2;
+  checkCudaErrors(cudaMalloc((void **) &d_vals_sorted, 
         sizeof(unsigned int) * numElems));
   checkCudaErrors(cudaMalloc((void **) &d_vals_2, 
         sizeof(unsigned int) * numElems));
-  cudaMemcpy(d_vals_1, d_vals, sizeof(unsigned int) * numElems,
+  cudaMemcpy(d_vals_sorted, d_vals, sizeof(unsigned int) * numElems,
       cudaMemcpyDeviceToDevice);
     
   unsigned int * d_num_zeros;
@@ -210,14 +239,14 @@ void computeHistogram(const unsigned int* const d_vals, //INPUT
   // Determine how many bits actually need to be sorted
   // TODO why doesn't this work???
   int num_bits_to_sort = floor(log2((double)numCoarseBins)) + 1;
-  num_bits_to_sort = 16;
+  num_bits_to_sort = floor(log2((double)numCoarseBins)) + 2;
 
   for (int b = 0; b < num_bits_to_sort; ++b) {
     unsigned int* d_in_vals, * d_out_vals;
     unsigned short* d_in_coarse_bin_ids, * d_out_coarse_bin_ids;
     if (b % 2 == 0) {
       d_in_coarse_bin_ids = d_coarse_bin_ids;
-      d_in_vals = d_vals_1;
+      d_in_vals = d_vals_sorted;
       d_out_coarse_bin_ids = d_coarse_bin_ids_tmp;
       d_out_vals = d_vals_2;
     }
@@ -225,7 +254,7 @@ void computeHistogram(const unsigned int* const d_vals, //INPUT
       d_in_coarse_bin_ids = d_coarse_bin_ids_tmp;
       d_in_vals = d_vals_2;
       d_out_coarse_bin_ids = d_coarse_bin_ids;
-      d_out_vals = d_vals_1;
+      d_out_vals = d_vals_sorted;
     }
 
     // Compute the number of zeros for this bit
@@ -264,14 +293,14 @@ void computeHistogram(const unsigned int* const d_vals, //INPUT
   cudaFree(d_vals_2);
   cudaFree(d_num_zeros);
 
-  // Note: sorted bins/vals stored in d_coarse_bin_ids, d_vals_1 
+  // Note: sorted bins/vals stored in d_coarse_bin_ids, d_vals_sorted 
 
   /*
   unsigned short* h_bin_ids = new unsigned short[numElems];   
   unsigned int* h_vals = new unsigned int[numElems];   
   checkCudaErrors(cudaMemcpy(h_bin_ids, d_coarse_bin_ids, 
         sizeof(unsigned short) * numElems, cudaMemcpyDeviceToHost));
-  checkCudaErrors(cudaMemcpy(h_vals, d_vals_1, 
+  checkCudaErrors(cudaMemcpy(h_vals, d_vals_sorted, 
         sizeof(unsigned int) * numElems, cudaMemcpyDeviceToHost));
   for (std::size_t i = 0; i < numElems; ++i) {
     std::cout << h_vals[i] << " " << h_bin_ids[i] << std::endl;
@@ -281,12 +310,38 @@ void computeHistogram(const unsigned int* const d_vals, //INPUT
   */
 
   //////////////////////////////////////////////////////////////////
-  // Find where each coarse bin begins/ends
+  // Find where each coarse bin begins
   //////////////////////////////////////////////////////////////////
-  // TODO
+  unsigned int* d_coarse_bin_starts;
+  checkCudaErrors(cudaMalloc((void **) &d_coarse_bin_starts,
+        numCoarseBins * sizeof(unsigned int)));
+  checkCudaErrors(cudaMemset(d_coarse_bin_starts, 0, 
+        sizeof(unsigned int)));
 
+  find_coarse_bin_starts<<<gridSize, blockSize>>>(d_coarse_bin_ids,
+      d_coarse_bin_starts, numElems);
+ 
+  /* 
+  unsigned int* h_bin_starts = new unsigned int[numCoarseBins];   
+  checkCudaErrors(cudaMemcpy(h_bin_starts, d_coarse_bin_starts, 
+        sizeof(unsigned int) * numCoarseBins, cudaMemcpyDeviceToHost));
+  for (int i = 0; i < numCoarseBins; ++i) {
+    std::cout << h_bin_starts[i] << std::endl;
+  }
+  delete[] h_bin_starts;
+  */
+  
   cudaFree(d_coarse_bin_ids);
-  cudaFree(d_vals_1);
+  
+  //////////////////////////////////////////////////////////////////
+  // Construct local histograms and concatenate
+  //////////////////////////////////////////////////////////////////
+  construct_hist<<<numCoarseBins, 1024, 
+    numBins * sizeof(unsigned int)>>>(d_coarse_bin_starts,
+      d_vals_sorted, d_histo, numElems);
+
+  cudaFree(d_vals_sorted);
+  cudaFree(d_coarse_bin_starts);
 
   cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
 }
